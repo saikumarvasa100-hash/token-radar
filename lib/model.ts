@@ -8,14 +8,14 @@
 //
 // Implied value follows only from the snapshot's own figures:
 //
-//   base       = tvl_usd x BASE_MULTIPLE
-//   growth     = clamp(change_7d, -60, 120) per cent
-//   growthMult = 1 + (growth / 100) x GROWTH_WEIGHT
-//   maturity   = 0.6 + min(age_days, 1095) / 1095 x 0.4   (age_days unknown: 365)
-//   implied    = max(1, round(base x growthMult x maturity))
+//   category_multiple = median mcap/tvl of token-bearing protocols in this category (from snapshot)
+//   chain_premium     = 1 + 0.05 * min(blue_chip_chains, 3) + 0.02 * max(total_chains - 1, 0)
+//   growth_factor     = 1 + clamp(change_7d, -50, 100) / 100 * 0.3
+//   maturity_factor   = 0.6 + 0.4 * min(age_days, 1095) / 1095    (age_days unknown: 365)
+//   scale_factor      = 1 / (1 + 0.1 * max(log10(tvl_usd / 1e8), 0))
+//   implied           = max(1, round(tvl_usd * category_multiple * chain_premium * growth_factor * maturity_factor * scale_factor))
 //
-// The constants are the house model's, stated in the dashboard and changeable in the model sandbox. No
-// protocol name is ever special-cased: the same function scores every row.
+// No protocol name is ever special-cased: the same function scores every row.
 
 /** The snapshot's protocol entry: exactly the ten fields the sealed input carries. */
 export interface SnapshotProtocol {
@@ -42,29 +42,44 @@ export interface Snapshot {
 
 /** The model's constants, as the dashboard states them and the sandbox may change them. */
 export interface ModelConstants {
-  base_multiple: number;
+  // Category benchmark: will be computed from snapshot; this is the global fallback
+  global_multiple: number;
+  // Chain premium weights
+  blue_chip_weight: number;
+  blue_chip_cap: number;
+  extra_chain_weight: number;
+  // Growth weight and clamps
   growth_weight: number;
   growth_floor: number;
   growth_cap: number;
+  // Maturity
   maturity_floor: number;
   maturity_range: number;
   maturity_days: number;
   unknown_age_days: number;
+  // Scale (TVL diminishing returns)
+  scale_anchor_tvl: number;   // TVL at which scale_factor = 1.0
+  scale_decay: number;        // decay per log10 above anchor
 }
 
 export const MODEL: ModelConstants = {
-  base_multiple: 0.25,
-  growth_weight: 0.5,
-  growth_floor: -60,
-  growth_cap: 120,
+  global_multiple: 0.2227,
+  blue_chip_weight: 0.05,
+  blue_chip_cap: 3,
+  extra_chain_weight: 0.02,
+  growth_weight: 0.3,
+  growth_floor: -50,
+  growth_cap: 100,
   maturity_floor: 0.6,
   maturity_range: 0.4,
   maturity_days: 1095,
   unknown_age_days: 365,
+  scale_anchor_tvl: 1e8,
+  scale_decay: 0.1,
 };
 
 /** The model's version label: the dashboard names it and the rules quote it. */
-export const MODEL_VERSION = 'radar-1';
+export const MODEL_VERSION = 'radar-2';
 
 /** How many pre-token protocols below the watchlist floor the early radar carries, by TVL. */
 export const EARLY_ROWS = 160;
@@ -96,13 +111,20 @@ export interface BoardRow {
   age_days: number | null;
   implied_value_usd: number;
   model: {
-    base_multiple: number;
+    category_multiple: number;
+    chain_premium: number;
+    growth_factor: number;
+    maturity_factor: number;
+    scale_factor: number;
+    category_peer_count: number;
+    blue_chip_chains: number;
+    total_chains: number;
     growth_pct: number;
-    growth_multiplier: number;
-    maturity_multiplier: number;
     age_days: number | null;
+    tvl_usd: number;
   };
   farm_steps: string[];
+  rationale: string;
 }
 
 /** The dashboard's compact view of one row, with farm plans generated in the page. */
@@ -118,8 +140,20 @@ export interface RadarRow {
   listed_at: string | null;
   age_days: number | null;
   implied_value_usd: number;
-  growth_multiplier: number;
-  maturity_multiplier: number;
+  model: {
+    category_multiple: number;
+    chain_premium: number;
+    growth_factor: number;
+    maturity_factor: number;
+    scale_factor: number;
+    category_peer_count: number;
+    blue_chip_chains: number;
+    total_chains: number;
+    growth_pct: number;
+    age_days: number | null;
+    tvl_usd: number;
+  };
+  rationale: string;
 }
 
 /** A live-token protocol: it already trades, so the board shows the market's own value, not a model's. */
@@ -156,6 +190,12 @@ export class SnapshotError extends Error {
   }
 }
 
+// Blue-chip chains (the house model's set)
+const BLUE_CHIP_CHAINS = new Set([
+  'Ethereum', 'Solana', 'Base', 'Arbitrum', 'Optimism', 'BNB', 'Binance',
+  'Polygon', 'Avalanche', 'Sui', 'Hyperliquid', 'Hyperliquid L1'
+]);
+
 const DAY_MS = 86_400_000;
 
 /** A finite number, else `fallback`. */
@@ -172,17 +212,69 @@ export function ageDays(asOf: string, listedAt: string | null): number | null {
   return Math.max(0, Math.floor((a - b) / DAY_MS));
 }
 
+/** Compute category multiples from token-bearing protocols in the snapshot. */
+function computeCategoryMultiples(protocols: SnapshotProtocol[]): Map<string, { multiple: number; peerCount: number }> {
+  const byCat = new Map<string, number[]>();
+  for (const p of protocols) {
+    if (p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0) {
+      const c = p.category ?? 'Other';
+      const arr = byCat.get(c) ?? [];
+      arr.push(p.mcap_usd / p.tvl_usd);
+      byCat.set(c, arr);
+    }
+  }
+  const out = new Map<string, { multiple: number; peerCount: number }>();
+  for (const [cat, multiples] of byCat) {
+    if (multiples.length >= 3) {
+      multiples.sort((a, b) => a - b);
+      out.set(cat, { multiple: multiples[Math.floor(multiples.length / 2)], peerCount: multiples.length });
+    }
+  }
+  return out;
+}
+
 /** The three multipliers and the implied value one protocol gets under `model`. */
-export function impliedValue(protocol: SnapshotProtocol, asOf: string, model: ModelConstants): { implied: number; growthPct: number; growthMult: number; maturityMult: number; age: number | null } {
+export function impliedValue(
+  protocol: SnapshotProtocol,
+  asOf: string,
+  model: ModelConstants,
+  catMultiples: Map<string, { multiple: number; peerCount: number }>
+): {
+  implied: number;
+  category_multiple: number;
+  chain_premium: number;
+  growth_factor: number;
+  maturity_factor: number;
+  scale_factor: number;
+  category_peer_count: number;
+  blue_chip_chains: number;
+  total_chains: number;
+  growth_pct: number;
+  age: number | null;
+} {
   const age = ageDays(asOf, protocol.listed_at);
+  const cat = protocol.category ?? 'Other';
+  const catInfo = catMultiples.get(cat);
+  const category_multiple = catInfo ? catInfo.multiple : model.global_multiple;
+  const category_peer_count = catInfo ? catInfo.peerCount : 0;
+
   const rawGrowth = finite(protocol.change_7d, 0);
-  const growthPct = Math.min(model.growth_cap, Math.max(model.growth_floor, rawGrowth));
-  const growthMult = 1 + (growthPct / 100) * model.growth_weight;
+  const growth_pct = Math.min(model.growth_cap, Math.max(model.growth_floor, rawGrowth));
+  const growth_factor = 1 + (growth_pct / 100) * model.growth_weight;
+
   const ageForModel = age ?? model.unknown_age_days;
-  const maturityMult = model.maturity_floor + (Math.min(Math.max(ageForModel, 0), model.maturity_days) / model.maturity_days) * model.maturity_range;
-  const base = protocol.tvl_usd * model.base_multiple;
-  const implied = Math.max(1, Math.round(base * growthMult * maturityMult));
-  return { implied, growthPct, growthMult, maturityMult, age };
+  const maturity_factor = model.maturity_floor + (Math.min(Math.max(ageForModel, 0), model.maturity_days) / model.maturity_days) * model.maturity_range;
+
+  const blue_chip_chains = protocol.chains.filter(c => BLUE_CHIP_CHAINS.has(c)).length;
+  const total_chains = protocol.chains.length;
+  const chain_premium = 1 + model.blue_chip_weight * Math.min(blue_chip_chains, model.blue_chip_cap) + model.extra_chain_weight * Math.max(total_chains - 1, 0);
+
+  const scale_factor = 1 / (1 + model.scale_decay * Math.max(Math.log10(protocol.tvl_usd / model.scale_anchor_tvl), 0));
+
+  const base = protocol.tvl_usd * category_multiple;
+  const implied = Math.max(1, Math.round(base * chain_premium * growth_factor * maturity_factor * scale_factor));
+
+  return { implied, category_multiple, chain_premium, growth_factor, maturity_factor, scale_factor, category_peer_count, blue_chip_chains, total_chains, growth_pct, age };
 }
 
 /** DefiLlama's version-marker rule: a name ending in a release is a pool of another protocol. */
@@ -211,6 +303,32 @@ export interface BoardSummary {
   live_size: number;
 }
 
+/** Format a number with tabular numerals for display. */
+function fmt(n: number): string {
+  return new Intl.NumberFormat('en-US', { notation: 'compact', maximumFractionDigits: 1 }).format(n);
+}
+
+/** Build a human-readable rationale sentence. */
+function buildRationale(p: SnapshotProtocol, parts: {
+  category_multiple: number;
+  chain_premium: number;
+  growth_factor: number;
+  maturity_factor: number;
+  scale_factor: number;
+  category_peer_count: number;
+  blue_chip_chains: number;
+  total_chains: number;
+  growth_pct: number;
+  age: number | null;
+}): string {
+  const cat = p.category ?? 'Other';
+  const ageStr = parts.age === null ? 'unknown age' : parts.age < 365 ? `${parts.age}d` : `${(parts.age / 365).toFixed(1)}y`;
+  const growthStr = parts.growth_pct >= 0 ? `+${parts.growth_pct.toFixed(1)}%` : `${parts.growth_pct.toFixed(1)}%`;
+  const blueChipStr = parts.blue_chip_chains > 0 ? `${parts.blue_chip_chains} blue-chip chain${parts.blue_chip_chains === 1 ? '' : 's'}` : 'no blue-chip chains';
+  const peerStr = parts.category_peer_count >= 3 ? `(${parts.category_peer_count} token peers)` : '(global fallback)';
+  return `${cat} protocol, ${ageStr}, ${growthStr} 7d, ${blueChipStr} ${peerStr}. Category multiple ${parts.category_multiple.toFixed(3)}x TVL, chain premium ${parts.chain_premium.toFixed(2)}x, growth ${parts.growth_factor.toFixed(2)}x, maturity ${parts.maturity_factor.toFixed(2)}x, scale ${parts.scale_factor.toFixed(2)}x.`;
+}
+
 /** The protocols the board ranks, strongest first, with ranks 1..n. */
 export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): BoardRow[] {
   const index = bySlug(snapshot.protocols);
@@ -229,9 +347,12 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
     .slice(0, EARLY_ROWS);
   for (const p of early) chosen.set(p.slug, p);
 
+  // Compute category multiples from all token-bearing protocols in snapshot
+  const catMultiples = computeCategoryMultiples(snapshot.protocols);
+
   const scored = [...chosen.values()].map((p) => {
-    const { implied, growthPct, growthMult, maturityMult, age } = impliedValue(p, snapshot.as_of, model);
-    return { p, implied, growthPct, growthMult, maturityMult, age };
+    const parts = impliedValue(p, snapshot.as_of, model, catMultiples);
+    return { p, ...parts };
   });
   scored.sort((a, b) => b.implied - a.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
   return scored.map((s, i) => ({
@@ -250,17 +371,22 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
     age_days: s.age,
     implied_value_usd: s.implied,
     model: {
-      base_multiple: model.base_multiple,
-      growth_pct: s.growthPct,
-      growth_multiplier: round4(s.growthMult),
-      maturity_multiplier: round4(s.maturityMult),
+      category_multiple: Math.round(s.category_multiple * 1e4) / 1e4,
+      chain_premium: Math.round(s.chain_premium * 1e4) / 1e4,
+      growth_factor: Math.round(s.growth_factor * 1e4) / 1e4,
+      maturity_factor: Math.round(s.maturity_factor * 1e4) / 1e4,
+      scale_factor: Math.round(s.scale_factor * 1e4) / 1e4,
+      category_peer_count: s.category_peer_count,
+      blue_chip_chains: s.blue_chip_chains,
+      total_chains: s.total_chains,
+      growth_pct: Math.round(s.growth_pct * 100) / 100,
       age_days: s.age,
+      tvl_usd: s.p.tvl_usd,
     },
     farm_steps: farmSteps(s.p, s.age).map(stepText),
+    rationale: buildRationale(s.p, s),
   }));
 }
-
-const round4 = (n: number): number => Math.round(n * 1e4) / 1e4;
 
 /** A step as one string: its action, then its cost and time, within the gate's 20..600 characters. */
 export function stepText(step: FarmStep): string {
@@ -270,67 +396,98 @@ export function stepText(step: FarmStep): string {
   return s;
 }
 
-/** The first chain a protocol names, or a neutral phrase. */
-function chainOf(p: SnapshotProtocol): string {
-  return p.chains.length > 0 ? p.chains[0]! : 'its main chain';
-}
-
-/** How much capital one farm position needs, from the protocol's own TVL. */
+/** Capital tier from TVL: larger protocols need more capital to be noticed. */
 function capitalFor(p: SnapshotProtocol): number {
-  if (p.tvl_usd >= 5_000_000_000) return 250;
-  if (p.tvl_usd >= 1_000_000_000) return 150;
-  if (p.tvl_usd >= 100_000_000) return 100;
+  if (p.tvl_usd >= 5_000_000_000) return 500;
+  if (p.tvl_usd >= 1_000_000_000) return 250;
+  if (p.tvl_usd >= 100_000_000) return 150;
+  if (p.tvl_usd >= 10_000_000) return 100;
   return 50;
 }
 
-/** How long to hold, from the protocol's age: younger protocols get a longer qualifying window. */
+/** Hold days from age: younger protocols need longer qualifying window. */
 function holdDaysFor(age: number | null): number {
-  if (age === null) return 30;
+  if (age === null) return 60;
+  if (age < 90) return 90;
   if (age < 180) return 60;
   if (age < 365) return 45;
   return 30;
 }
 
-/** The category's one action, in the words a farmer can follow. */
-function actionFor(p: SnapshotProtocol, capital: number, chain: string): string {
+/** Category-specific action verb and asset. */
+function categoryAction(p: SnapshotProtocol, capital: number, chain: string): { verb: string; asset: string; target: string } {
   const c = (p.category ?? '').toLowerCase();
   const name = p.name;
-  if (c.includes('lend') || c.includes('cdp') || c.includes('collateral')) return `Supply $${capital} of USDC to ${name} on ${chain} and keep the position open.`;
-  if (c.includes('dex') || c.includes('yield') || c.includes('leveraged farm')) return `Provide $${capital} of liquidity to ${name}'s main pool on ${chain} and keep the position open.`;
-  if (c.includes('bridge')) return `Bridge $${capital} of USDC to ${chain} through ${name} and use the bridged funds in its app.`;
-  if (c.includes('staking') || c.includes('restak')) return `Stake $${capital} of the chain's staking asset through ${name} and keep the receipt.`;
-  if (c.includes('perpetual') || c.includes('derivative')) return `Deposit $${capital} of USDC as margin on ${name} and open one small hedge.`;
-  if (c.includes('prediction')) return `Fund $${capital} and place one market position on ${name}.`;
-  if (c.includes('curator') || c.includes('allocator')) return `Deposit $${capital} into a ${name} vault on ${chain} and keep the shares.`;
-  if (c.includes('stable')) return `Mint or deposit $${capital} of the stable asset through ${name} on ${chain}.`;
-  if (c.includes('rwa')) return `Mint $${capital} of the protocol's yield asset on ${chain} and hold it.`;
-  if (c.includes('insurance')) return `Buy $${capital} of cover from ${name} on ${chain} and keep the policy.`;
-  return `Deposit $${capital} of USDC into ${name} on ${chain} and keep the position open.`;
+  if (c.includes('lend') || c.includes('cdp') || c.includes('collateral')) {
+    return { verb: 'Supply', asset: `$${capital} USDC`, target: `to ${name} on ${chain}` };
+  }
+  if (c.includes('dex') || c.includes('yield') || c.includes('leveraged farm') || c.includes('amm')) {
+    return { verb: 'Provide liquidity', asset: `$${capital} to ${name}'s main pool`, target: `on ${chain}` };
+  }
+  if (c.includes('bridge') || c.includes('cross chain')) {
+    return { verb: 'Bridge', asset: `$${capital} USDC`, target: `to ${chain} via ${name}` };
+  }
+  if (c.includes('staking') || c.includes('restak') || c.includes('liquid staking')) {
+    return { verb: 'Stake', asset: `$${capital} of the chain's staking asset`, target: `through ${name}` };
+  }
+  if (c.includes('perpetual') || c.includes('derivative') || c.includes('options')) {
+    return { verb: 'Deposit margin', asset: `$${capital} USDC`, target: `on ${name} and open a small hedge` };
+  }
+  if (c.includes('prediction')) {
+    return { verb: 'Fund', asset: `$${capital}`, target: `and place one market position on ${name}` };
+  }
+  if (c.includes('curator') || c.includes('allocator') || c.includes('vault')) {
+    return { verb: 'Deposit', asset: `$${capital}`, target: `into a ${name} vault on ${chain}` };
+  }
+  if (c.includes('stable') || c.includes('algo-stable')) {
+    return { verb: 'Mint or deposit', asset: `$${capital} of the stable asset`, target: `through ${name} on ${chain}` };
+  }
+  if (c.includes('rwa') || c.includes('real world')) {
+    return { verb: 'Mint', asset: `$${capital} of ${name}'s yield asset`, target: `on ${chain}` };
+  }
+  if (c.includes('insurance')) {
+    return { verb: 'Buy cover', asset: `$${capital}`, target: `from ${name} on ${chain}` };
+  }
+  if (c.includes('basis trading') || c.includes('delta neutral')) {
+    return { verb: 'Deploy', asset: `$${capital} in delta-neutral strategy`, target: `via ${name} on ${chain}` };
+  }
+  if (c.includes('risk curator') || c.includes('risk management')) {
+    return { verb: 'Allocate', asset: `$${capital} to ${name}'s risk vault`, target: `on ${chain}` };
+  }
+  if (c.includes('payment')) {
+    return { verb: 'Send', asset: `$${capital} USDC`, target: `through ${name} on ${chain}` };
+  }
+  if (c.includes('chain') || c.includes('l2') || c.includes('l1')) {
+    return { verb: 'Bridge', asset: `$${capital} USDC`, target: `to ${name} (${chain}) and use a core app` };
+  }
+  return { verb: 'Deposit', asset: `$${capital} USDC`, target: `into ${name} on ${chain}` };
 }
 
 /**
- * A protocol's farm plan: six steps, each an action with a cost and a time. The plan is derived from
+ * A protocol's farm plan: 6 steps, each an action with a cost and a time. The plan is derived from
  * the protocol's own record (category, chains, TVL, age), never from a hand-written list of names.
  */
 export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
-  const chain = chainOf(p);
+  const primaryChain = p.chains.length > 0 ? p.chains[0]! : 'its main chain';
   const capital = capitalFor(p);
   const hold = holdDaysFor(age);
-  const action = actionFor(p, capital, chain);
-  return [
+  const action = categoryAction(p, capital, primaryChain);
+  const baseAction = `${action.verb} ${action.asset} ${action.target} and keep the position open.`;
+
+  const steps: FarmStep[] = [
     {
       text: `Use a fresh wallet that holds only the funds you plan to farm, and keep its seed phrase offline.`,
       cost: 'under $3 of gas for the first transaction',
       time: '5 minutes',
     },
     {
-      text: action,
-      cost: `$${capital} of capital and about $${capital >= 150 ? 8 : 4} of gas`,
+      text: baseAction,
+      cost: `$${capital} of capital and about $${capital >= 250 ? 12 : capital >= 150 ? 8 : 4} of gas`,
       time: '15 minutes to set up',
     },
     {
-      text: `Make one qualifying action each week, such as a deposit, a borrow, a swap or a vote.`,
-      cost: 'about $2 of gas a week',
+      text: `Make one qualifying action each week: ${categoryWeeklyAction(p)}`,
+      cost: 'about $2–5 of gas per week',
       time: '10 minutes a week',
     },
     {
@@ -349,6 +506,27 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
       time: '5 minutes',
     },
   ];
+  return steps;
+}
+
+/** Category-specific weekly qualifying action. */
+function categoryWeeklyAction(p: SnapshotProtocol): string {
+  const c = (p.category ?? '').toLowerCase();
+  if (c.includes('lend') || c.includes('cdp') || c.includes('collateral')) return 'a deposit, borrow, or repay';
+  if (c.includes('dex') || c.includes('yield') || c.includes('leveraged farm') || c.includes('amm')) return 'a swap, add/remove liquidity, or harvest';
+  if (c.includes('bridge') || c.includes('cross chain')) return 'a bridge transaction or use bridged funds in an app';
+  if (c.includes('staking') || c.includes('restak') || c.includes('liquid staking')) return 'a stake, re-stake, or claim rewards';
+  if (c.includes('perpetual') || c.includes('derivative') || c.includes('options')) return 'a trade, adjust margin, or settle a position';
+  if (c.includes('prediction')) return 'a new position or adjust an existing one';
+  if (c.includes('curator') || c.includes('allocator') || c.includes('vault')) return 'a deposit, withdraw, or rebalance';
+  if (c.includes('stable') || c.includes('algo-stable')) return 'a mint, redeem, or swap';
+  if (c.includes('rwa') || c.includes('real world')) return 'a mint, redeem, or hold the yield asset';
+  if (c.includes('insurance')) return 'buy or renew cover, or file a claim if eligible';
+  if (c.includes('basis trading') || c.includes('delta neutral')) return 'rebalance the delta-neutral position';
+  if (c.includes('risk curator') || c.includes('risk management')) return 'adjust allocation or rebalance the vault';
+  if (c.includes('payment')) return 'a send, receive, or swap transaction';
+  if (c.includes('chain') || c.includes('l2') || c.includes('l1')) return 'a bridge, swap, or app interaction on the chain';
+  return 'a deposit, swap, or vote';
 }
 
 /** The live-token protocols, by market cap, for the dashboard's Live token view. */
@@ -382,8 +560,20 @@ export function radarRow(row: BoardRow): RadarRow {
     listed_at: row.listed_at,
     age_days: row.age_days,
     implied_value_usd: row.implied_value_usd,
-    growth_multiplier: row.model.growth_multiplier,
-    maturity_multiplier: row.model.maturity_multiplier,
+    model: {
+      category_multiple: row.model.category_multiple,
+      chain_premium: row.model.chain_premium,
+      growth_factor: row.model.growth_factor,
+      maturity_factor: row.model.maturity_factor,
+      scale_factor: row.model.scale_factor,
+      category_peer_count: row.model.category_peer_count,
+      blue_chip_chains: row.model.blue_chip_chains,
+      total_chains: row.model.total_chains,
+      growth_pct: row.model.growth_pct,
+      age_days: row.model.age_days,
+      tvl_usd: row.model.tvl_usd,
+    },
+    rationale: row.rationale,
   };
 }
 
